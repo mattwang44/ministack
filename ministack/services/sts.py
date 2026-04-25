@@ -6,15 +6,61 @@ Actions:
   GetSessionToken, GetAccessKeyInfo.
 """
 
+import copy
 import json
+import re
 import time
 from urllib.parse import parse_qs
 
-from ministack.core.responses import get_account_id, json_response, new_uuid
+from ministack.core.responses import AccountScopedDict, get_account_id, json_response, new_uuid
+from ministack.core.persistence import load_state
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
-# and reuses IAM's XML builders and credential generators.
+# (modulo assumed-role session tracking) and reuses IAM's XML builders
+# and credential generators.
 from ministack.services.iam import _p, _xml, _error, _future, \
     _gen_session_access_key, _gen_secret, _gen_session_token
+
+
+# AccessKeyId -> {arn, user_id} for sessions issued via AssumeRole /
+# AssumeRoleWithWebIdentity. Lets GetCallerIdentity reflect the assumed
+# identity instead of always returning :root.
+_assumed_role_sessions = AccountScopedDict()
+
+
+_CRED_RE = re.compile(r"Credential=([A-Z0-9]+)/")
+
+
+def get_state():
+    return {"assumed_role_sessions": copy.deepcopy(_assumed_role_sessions)}
+
+
+def restore_state(data):
+    if not data:
+        return
+    _assumed_role_sessions.update(data.get("assumed_role_sessions", {}))
+
+
+def reset():
+    _assumed_role_sessions.clear()
+
+
+try:
+    _restored = load_state("sts")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    import logging
+    logging.getLogger(__name__).exception(
+        "Failed to restore persisted STS state; continuing fresh"
+    )
+
+
+def _extract_access_key_id(headers):
+    """Pull the AccessKeyId out of a SigV4 Authorization header.
+    Returns None when the request is unsigned or non-SigV4."""
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
+    match = _CRED_RE.search(auth)
+    return match.group(1) if match else None
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -41,12 +87,23 @@ async def handle_request(method, path, headers, body, query_params):
     use_json = "amz-json" in content_type
 
     if action == "GetCallerIdentity":
+        # If the calling credentials map to a tracked assumed-role session,
+        # return that identity; otherwise default to :root. Real AWS does
+        # the same lookup in IAM.
+        access_key_id = _extract_access_key_id(headers)
+        session = _assumed_role_sessions.get(access_key_id) if access_key_id else None
+        if session:
+            arn = session["arn"]
+            user_id = session["user_id"]
+        else:
+            arn = f"arn:aws:iam::{get_account_id()}:root"
+            user_id = get_account_id()
         if use_json:
-            return json_response({"Account": get_account_id(), "Arn": f"arn:aws:iam::{get_account_id()}:root", "UserId": get_account_id()})
+            return json_response({"Account": get_account_id(), "Arn": arn, "UserId": user_id})
         return _xml(200, "GetCallerIdentityResponse",
                     f"<GetCallerIdentityResult>"
-                    f"<Arn>arn:aws:iam::{get_account_id()}:root</Arn>"
-                    f"<UserId>{get_account_id()}</UserId>"
+                    f"<Arn>{arn}</Arn>"
+                    f"<UserId>{user_id}</UserId>"
                     f"<Account>{get_account_id()}</Account>"
                     f"</GetCallerIdentityResult>",
                     ns="sts")
@@ -63,10 +120,12 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn = role_arn.replace(":role/", ":assumed-role/", 1)
         if not assumed_arn.endswith(f"/{session_name}"):
             assumed_arn = f"{assumed_arn}/{session_name}"
+        assumed_user_id = f"{role_id}:{session_name}"
+        _assumed_role_sessions[access_key] = {"arn": assumed_arn, "user_id": assumed_user_id}
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
-                "AssumedRoleUser": {"AssumedRoleId": f"{role_id}:{session_name}", "Arn": assumed_arn},
+                "AssumedRoleUser": {"AssumedRoleId": assumed_user_id, "Arn": assumed_arn},
                 "PackedPolicySize": 0,
             })
         return _xml(200, "AssumeRoleResponse",
@@ -78,7 +137,7 @@ async def handle_request(method, path, headers, body, query_params):
                     f"<Expiration>{expiration}</Expiration>"
                     f"</Credentials>"
                     f"<AssumedRoleUser>"
-                    f"<AssumedRoleId>{role_id}:{session_name}</AssumedRoleId>"
+                    f"<AssumedRoleId>{assumed_user_id}</AssumedRoleId>"
                     f"<Arn>{assumed_arn}</Arn>"
                     f"</AssumedRoleUser>"
                     f"<PackedPolicySize>0</PackedPolicySize>"
@@ -97,10 +156,12 @@ async def handle_request(method, path, headers, body, query_params):
             assumed_arn = f"{assumed_arn}/{session}"
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
+        assumed_user_id = f"{role_id}:{session}"
+        _assumed_role_sessions[access_key] = {"arn": assumed_arn, "user_id": assumed_user_id}
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": time.time() + duration},
-                "AssumedRoleUser": {"AssumedRoleId": f"{role_id}:{session}", "Arn": assumed_arn},
+                "AssumedRoleUser": {"AssumedRoleId": assumed_user_id, "Arn": assumed_arn},
                 "SubjectFromWebIdentityToken": "test-subject",
                 "Audience": "sts.amazonaws.com",
                 "Provider": provider,
@@ -114,7 +175,7 @@ async def handle_request(method, path, headers, body, query_params):
                     f"<Expiration>{_future(duration)}</Expiration>"
                     f"</Credentials>"
                     f"<AssumedRoleUser>"
-                    f"<AssumedRoleId>{role_id}:{session}</AssumedRoleId>"
+                    f"<AssumedRoleId>{assumed_user_id}</AssumedRoleId>"
                     f"<Arn>{assumed_arn}</Arn>"
                     f"</AssumedRoleUser>"
                     f"<SubjectFromWebIdentityToken>test-subject</SubjectFromWebIdentityToken>"

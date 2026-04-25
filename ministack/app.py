@@ -1111,7 +1111,7 @@ async def _handle_lifespan(scope, receive, send):
                     "servicediscovery": "servicediscovery", "s3files": "s3files",
                     "appconfig": "appconfig", "transfer": "transfer",
                     "scheduler": "scheduler", "autoscaling": "autoscaling",
-                    "eks": "eks",
+                    "eks": "eks", "sts": "sts",
                 }
                 save_dict = {}
                 for key, mod_name in _state_map.items():
