@@ -429,6 +429,166 @@ def _match_recursive(resources, parent_id, segments, params):
     return None, params
 
 
+def _build_method_arn(api_id, stage_name, method, request_path):
+    """Build the methodArn string AWS passes into Lambda authorizers."""
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    return (
+        f"arn:aws:execute-api:{region}:{get_account_id()}:"
+        f"{api_id}/{stage_name}/{method}/{request_path.lstrip('/')}"
+    )
+
+
+def _resolve_token_from_identity_source(identity_source, headers, query_params):
+    """Resolve a TOKEN authorizer's identity source spec to the actual value.
+    AWS's identitySource format: 'method.request.header.<HeaderName>',
+    'method.request.querystring.<Param>', or stage variables. We implement
+    headers and querystrings; missing values yield empty string."""
+    if not identity_source:
+        return ""
+    spec = identity_source.split(",")[0].strip()
+    if spec.startswith("method.request.header."):
+        name = spec.split(".", 3)[-1]
+        for k, v in headers.items():
+            if k.lower() == name.lower():
+                return v if isinstance(v, str) else (v[-1] if v else "")
+        return ""
+    if spec.startswith("method.request.querystring."):
+        name = spec.split(".", 3)[-1]
+        v = (query_params or {}).get(name)
+        if isinstance(v, list):
+            return v[0] if v else ""
+        return v or ""
+    return ""
+
+
+def _policy_allows(policy_doc, method_arn):
+    """Walk a (very small subset of) IAM policy doc and answer Allow/Deny
+    for an execute-api:Invoke action against ``method_arn``. Returns True
+    iff there is an explicit Allow that matches and no explicit Deny."""
+    if not isinstance(policy_doc, dict):
+        return False
+    statements = policy_doc.get("Statement") or []
+    if isinstance(statements, dict):
+        statements = [statements]
+
+    def _matches_resource(resource, target):
+        if isinstance(resource, list):
+            return any(_matches_resource(r, target) for r in resource)
+        if not isinstance(resource, str):
+            return False
+        if resource == "*":
+            return True
+        # Naive AWS-style wildcard expansion: '?' -> '.', '*' -> '.*'.
+        import re as _re
+        pattern = "^" + _re.escape(resource).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+        return bool(_re.match(pattern, target))
+
+    explicit_deny = False
+    explicit_allow = False
+    for stmt in statements:
+        if not isinstance(stmt, dict):
+            continue
+        action = stmt.get("Action")
+        if isinstance(action, str):
+            actions = [action]
+        elif isinstance(action, list):
+            actions = action
+        else:
+            actions = []
+        action_match = any(a == "*" or a == "execute-api:Invoke" or a == "execute-api:*"
+                           for a in actions)
+        if not action_match:
+            continue
+        if not _matches_resource(stmt.get("Resource"), method_arn):
+            continue
+        effect = stmt.get("Effect")
+        if effect == "Deny":
+            explicit_deny = True
+        elif effect == "Allow":
+            explicit_allow = True
+    return explicit_allow and not explicit_deny
+
+
+async def _run_authorizer_v1(authorizer, api_id, stage_name, method, request_path,
+                             headers, body, query_params):
+    """Invoke a Lambda authorizer and return (allowed, principal_id, context).
+
+    Supports TOKEN and REQUEST authorizer types. ``allowed`` reflects
+    whether the returned policy explicitly allows execute-api:Invoke on
+    this method ARN; ``context`` is the authorizer's context dict (made
+    available to the integration as requestContext.authorizer).
+    """
+    authorizer_uri = authorizer.get("authorizerUri", "")
+    auth_type = authorizer.get("type", "TOKEN")
+    method_arn = _build_method_arn(api_id, stage_name, method, request_path)
+
+    if auth_type == "TOKEN":
+        token = _resolve_token_from_identity_source(
+            authorizer.get("identitySource", "method.request.header.Authorization"),
+            headers, query_params,
+        )
+        auth_event = {
+            "type": "TOKEN",
+            "authorizationToken": token,
+            "methodArn": method_arn,
+        }
+    elif auth_type == "REQUEST":
+        single_headers = {k: v if isinstance(v, str) else (v[-1] if v else "") for k, v in headers.items()}
+        qs = {k: v[0] if isinstance(v, list) else v for k, v in (query_params or {}).items()}
+        auth_event = {
+            "type": "REQUEST",
+            "methodArn": method_arn,
+            "headers": single_headers,
+            "queryStringParameters": qs or None,
+            "httpMethod": method,
+            "path": request_path,
+        }
+    else:
+        # Unsupported type (e.g. COGNITO_USER_POOLS) — fail closed.
+        return False, None, {}
+
+    if "function:" in authorizer_uri:
+        tail = authorizer_uri.split("function:")[-1].split("/")[0]
+    else:
+        tail = authorizer_uri
+    from ministack.services import lambda_svc as _lambda_svc
+    func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(tail)
+
+    # We need the authorizer's raw return value ({principalId,
+    # policyDocument, context}), so bypass _call_lambda's API-proxy
+    # response shaping (which would wrap our dict inside
+    # {"statusCode": 200, "body": "<json>"}).
+    func_data, func_config = _lambda_svc._get_func_record_for_qualifier(
+        func_name, qualifier)
+    if func_data is None:
+        return False, None, {}
+    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    result = await asyncio.to_thread(
+        _lambda_svc._execute_function, exec_record, auth_event)
+    if result.get("error"):
+        return False, None, {}
+    response = result.get("body")
+    if isinstance(response, (str, bytes)):
+        if isinstance(response, bytes):
+            response = response.decode("utf-8", errors="replace")
+        try:
+            response = json.loads(response)
+        except (json.JSONDecodeError, ValueError):
+            return False, None, {}
+    if not isinstance(response, dict):
+        return False, None, {}
+
+    principal_id = response.get("principalId")
+    policy_doc = response.get("policyDocument") or {}
+    raw_context = response.get("context") or {}
+    # AWS coerces context values to strings before passing to the
+    # backend integration; mirror that so callers get the same shape.
+    context = {k: ("" if v is None else str(v)) for k, v in raw_context.items()}
+    if principal_id is not None:
+        context.setdefault("principalId", str(principal_id))
+    return _policy_allows(policy_doc, method_arn), principal_id, context
+
+
 async def _call_lambda(func_name, event, qualifier=None):
     """Invoke a Lambda function and return the parsed response dict.
 
@@ -810,10 +970,35 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
 
     int_type = integration.get("type", "")
 
+    # If the method is wired to a Lambda authorizer, run it now and
+    # capture (principalId, context) for forwarding to the backend
+    # integration. Deny -> 403 immediately. Custom = TOKEN/REQUEST
+    # Lambda; Cognito user-pool authorizers are not implemented and
+    # currently fail closed.
+    authorizer_context = None
+    authorizer_principal = None
+    if method_obj.get("authorizationType") == "CUSTOM":
+        auth_id = method_obj.get("authorizerId")
+        authorizer = (_authorizers_v1.get(api_id) or {}).get(auth_id) if auth_id else None
+        if not authorizer:
+            return 500, {"Content-Type": "application/json"}, \
+                json.dumps({"message": f"Authorizer '{auth_id}' not found on API"}).encode()
+        allowed, principal, ctx = await _run_authorizer_v1(
+            authorizer, api_id, stage_name, method, path,
+            headers, body, query_params,
+        )
+        if not allowed:
+            return 403, {"Content-Type": "application/json"}, \
+                json.dumps({"message": "User is not authorized to access this resource"}).encode()
+        authorizer_context = ctx
+        authorizer_principal = principal
+
     if int_type in ("AWS_PROXY", "AWS"):
         return await _invoke_lambda_proxy_v1(
             integration, api_id, stage_name, stage, resource, path, method,
-            headers, body, query_params, path_params
+            headers, body, query_params, path_params,
+            authorizer_context=authorizer_context,
+            authorizer_principal=authorizer_principal,
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(integration, path, method, headers, body, query_params)
@@ -823,8 +1008,11 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": f"Unsupported integration type: {int_type}"}).encode()
 
 
-async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params):
-    """Invoke Lambda with API Gateway v1 payload format 1.0."""
+async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params, authorizer_context=None, authorizer_principal=None):
+    """Invoke Lambda with API Gateway v1 payload format 1.0.
+
+    ``authorizer_context`` / ``authorizer_principal``, when supplied,
+    are surfaced to the integration as requestContext.authorizer.*."""
     uri = integration.get("uri", "")
     # Supported URI formats:
     #   1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
@@ -881,9 +1069,14 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
             "httpMethod": method,
             "apiId": api_id,
         },
-        "body": body.decode("utf-8", errors="replace") if body else None,
-        "isBase64Encoded": False,
     }
+    event["body"] = body.decode("utf-8", errors="replace") if body else None
+    event["isBase64Encoded"] = False
+    if authorizer_context is not None or authorizer_principal is not None:
+        ctx_block = dict(authorizer_context or {})
+        if authorizer_principal is not None and "principalId" not in ctx_block:
+            ctx_block["principalId"] = str(authorizer_principal)
+        event["requestContext"]["authorizer"] = ctx_block
 
     lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
     if err:

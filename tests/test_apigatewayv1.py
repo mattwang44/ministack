@@ -1364,3 +1364,386 @@ def test_apigwv1_lambda_proxy_emits_cloudwatch_logs_nodejs(apigw_v1, lam, logs):
 
     apigw_v1.delete_rest_api(restApiId=api_id)
     lam.delete_function(FunctionName=fname)
+
+
+# ---------------------------------------------------------------------------
+# Lambda authorizer (CUSTOM authorization) data plane
+# ---------------------------------------------------------------------------
+
+
+def _wire_authorizer_method(apigw_v1, lam, *, allow_token_substring="allow"):
+    """Helper: build an API with a TOKEN authorizer Lambda and a backend
+    Lambda echoing requestContext.authorizer. Returns api_id."""
+    import io as _io
+    import zipfile as _zf
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    authz_fn = f"authz-{suffix}"
+    backend_fn = f"backend-{suffix}"
+
+    def _zip(src):
+        buf = _io.BytesIO()
+        with _zf.ZipFile(buf, "w") as z:
+            z.writestr("index.py", src)
+        return buf.getvalue()
+
+    authz_code = (
+        "def handler(event, context):\n"
+        f"    token = event.get('authorizationToken') or ''\n"
+        f"    effect = 'Allow' if {allow_token_substring!r} in token.lower() else 'Deny'\n"
+        "    return {\n"
+        "        'principalId': 'probe-user',\n"
+        "        'policyDocument': {\n"
+        "            'Version': '2012-10-17',\n"
+        "            'Statement': [{\n"
+        "                'Action': 'execute-api:Invoke',\n"
+        "                'Effect': effect,\n"
+        "                'Resource': event.get('methodArn', '*'),\n"
+        "            }],\n"
+        "        },\n"
+        "        'context': {'caller': 'probe-user', 'flag': 'AUTHZ_OK'},\n"
+        "    }\n"
+    )
+    backend_code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    ctx = (event.get('requestContext') or {}).get('authorizer') or {}\n"
+        "    return {\n"
+        "        'statusCode': 200,\n"
+        "        'headers': {'Content-Type': 'application/json'},\n"
+        "        'body': json.dumps({'received_authorizer_context': ctx, 'marker': 'BACKEND_OK'}),\n"
+        "    }\n"
+    )
+    role = "arn:aws:iam::000000000000:role/test-role"
+    lam.create_function(FunctionName=authz_fn, Runtime="python3.12", Role=role,
+                        Handler="index.handler", Code={"ZipFile": _zip(authz_code)})
+    lam.create_function(FunctionName=backend_fn, Runtime="python3.12", Role=role,
+                        Handler="index.handler", Code={"ZipFile": _zip(backend_code)})
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-authz-{suffix}")["id"]
+    root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    res_id = apigw_v1.create_resource(restApiId=api_id, parentId=root["id"], pathPart="probe")["id"]
+
+    auth = apigw_v1.create_authorizer(
+        restApiId=api_id, name="probe-authz", type="TOKEN",
+        identitySource="method.request.header.Authorization",
+        authorizerUri=(
+            f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+            f"arn:aws:lambda:us-east-1:000000000000:function:{authz_fn}/invocations"
+        ),
+    )
+    apigw_v1.put_method(
+        restApiId=api_id, resourceId=res_id, httpMethod="GET",
+        authorizationType="CUSTOM", authorizerId=auth["id"],
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=res_id, httpMethod="GET",
+        type="AWS_PROXY", integrationHttpMethod="POST",
+        uri=(
+            f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+            f"arn:aws:lambda:us-east-1:000000000000:function:{backend_fn}/invocations"
+        ),
+    )
+    dep_id = apigw_v1.create_deployment(restApiId=api_id)["id"]
+    apigw_v1.create_stage(restApiId=api_id, stageName="probe", deploymentId=dep_id)
+    return api_id, authz_fn, backend_fn
+
+
+def test_apigwv1_token_authorizer_denies_request(apigw_v1, lam):
+    """A CUSTOM-authorizer-protected method must return 403 when the
+    authorizer Lambda's policy says Deny."""
+    import json as _json
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    api_id, authz_fn, backend_fn = _wire_authorizer_method(apigw_v1, lam)
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/probe/probe"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "deny-me")
+        try:
+            _urlreq.urlopen(req)
+            raise AssertionError("expected 403, got 200")
+        except _urlerr.HTTPError as e:
+            assert e.code == 403
+            payload = _json.loads(e.read())
+            assert "not authorized" in payload.get("message", "").lower()
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=authz_fn)
+        lam.delete_function(FunctionName=backend_fn)
+
+
+def test_apigwv1_token_authorizer_allows_and_forwards_context(apigw_v1, lam):
+    """An Allow policy must surface authorizer.context dict (and
+    principalId) to the backend integration via requestContext."""
+    import json as _json
+    import urllib.request as _urlreq
+
+    api_id, authz_fn, backend_fn = _wire_authorizer_method(apigw_v1, lam)
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/probe/probe"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "allow-please")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = _json.loads(resp.read())
+        assert body["marker"] == "BACKEND_OK"
+        ctx = body["received_authorizer_context"]
+        assert ctx["caller"] == "probe-user"
+        assert ctx["flag"] == "AUTHZ_OK"
+        assert ctx["principalId"] == "probe-user"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=authz_fn)
+        lam.delete_function(FunctionName=backend_fn)
+
+
+def test_apigwv1_authorizer_unconfigured_returns_500(apigw_v1, lam):
+    """A method declared CUSTOM but with an unknown authorizerId surfaces
+    as a server error rather than silently bypassing auth."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import io as _io
+    import uuid as _uuid
+    import zipfile as _zf
+
+    suffix = _uuid.uuid4().hex[:8]
+    backend_fn = f"backend-{suffix}"
+    buf = _io.BytesIO()
+    with _zf.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", "def handler(event, context):\n    return {'statusCode': 200, 'body': 'ok'}\n")
+    lam.create_function(FunctionName=backend_fn, Runtime="python3.12",
+                        Role="arn:aws:iam::000000000000:role/test-role",
+                        Handler="index.handler", Code={"ZipFile": buf.getvalue()})
+    api_id = apigw_v1.create_rest_api(name=f"v1-authz-bad-{suffix}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        res_id = apigw_v1.create_resource(restApiId=api_id, parentId=root["id"], pathPart="probe")["id"]
+        apigw_v1.put_method(
+            restApiId=api_id, resourceId=res_id, httpMethod="GET",
+            authorizationType="CUSTOM", authorizerId="nonexistent",
+        )
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=res_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{backend_fn}/invocations"
+            ),
+        )
+        dep = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="probe", deploymentId=dep)
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/probe/probe"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "anything")
+        try:
+            _urlreq.urlopen(req)
+            raise AssertionError("expected 500")
+        except _urlerr.HTTPError as e:
+            assert e.code == 500
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=backend_fn)
+
+
+def test_apigwv1_request_authorizer_inspects_headers(apigw_v1, lam):
+    """REQUEST authorizers receive headers + queryStringParameters in the
+    event payload (vs TOKEN's flat authorizationToken). The authorizer
+    can decide based on any header it cares about."""
+    import io as _io
+    import json as _json
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+    import zipfile as _zf
+
+    suffix = _uuid.uuid4().hex[:8]
+    authz_fn = f"req-authz-{suffix}"
+    backend_fn = f"req-backend-{suffix}"
+
+    def _zip(src):
+        buf = _io.BytesIO()
+        with _zf.ZipFile(buf, "w") as z:
+            z.writestr("index.py", src)
+        return buf.getvalue()
+
+    # REQUEST authorizer that allows iff header X-Probe-Allow == "yes".
+    authz_code = (
+        "def handler(event, context):\n"
+        "    headers = event.get('headers') or {}\n"
+        "    val = ''\n"
+        "    for k, v in headers.items():\n"
+        "        if k.lower() == 'x-probe-allow':\n"
+        "            val = v\n"
+        "            break\n"
+        "    effect = 'Allow' if val == 'yes' else 'Deny'\n"
+        "    return {\n"
+        "        'principalId': 'req-user',\n"
+        "        'policyDocument': {\n"
+        "            'Version': '2012-10-17',\n"
+        "            'Statement': [{\n"
+        "                'Action': 'execute-api:Invoke',\n"
+        "                'Effect': effect,\n"
+        "                'Resource': event.get('methodArn', '*'),\n"
+        "            }],\n"
+        "        },\n"
+        "        'context': {'inspected_header': val, 'auth_type': 'REQUEST'},\n"
+        "    }\n"
+    )
+    backend_code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    ctx = (event.get('requestContext') or {}).get('authorizer') or {}\n"
+        "    return {\n"
+        "        'statusCode': 200,\n"
+        "        'headers': {'Content-Type': 'application/json'},\n"
+        "        'body': json.dumps({'authorizer': ctx, 'marker': 'BACKEND_OK'}),\n"
+        "    }\n"
+    )
+    role = "arn:aws:iam::000000000000:role/test-role"
+    lam.create_function(FunctionName=authz_fn, Runtime="python3.12", Role=role,
+                        Handler="index.handler", Code={"ZipFile": _zip(authz_code)})
+    lam.create_function(FunctionName=backend_fn, Runtime="python3.12", Role=role,
+                        Handler="index.handler", Code={"ZipFile": _zip(backend_code)})
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-req-authz-{suffix}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        res_id = apigw_v1.create_resource(restApiId=api_id, parentId=root["id"], pathPart="probe")["id"]
+
+        auth = apigw_v1.create_authorizer(
+            restApiId=api_id, name="req-authz", type="REQUEST",
+            identitySource="method.request.header.X-Probe-Allow",
+            authorizerUri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{authz_fn}/invocations"
+            ),
+        )
+        apigw_v1.put_method(
+            restApiId=api_id, resourceId=res_id, httpMethod="GET",
+            authorizationType="CUSTOM", authorizerId=auth["id"],
+        )
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=res_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{backend_fn}/invocations"
+            ),
+        )
+        dep = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="probe", deploymentId=dep)
+
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/probe/probe"
+
+        # Allow path: header value "yes" → 200 + context echoes inspection.
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("X-Probe-Allow", "yes")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = _json.loads(resp.read())
+        assert body["authorizer"]["inspected_header"] == "yes"
+        assert body["authorizer"]["auth_type"] == "REQUEST"
+        assert body["authorizer"]["principalId"] == "req-user"
+
+        # Deny path: header missing → 403.
+        req2 = _urlreq.Request(url, method="GET")
+        req2.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        try:
+            _urlreq.urlopen(req2)
+            raise AssertionError("expected 403")
+        except _urlerr.HTTPError as e:
+            assert e.code == 403
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=authz_fn)
+        lam.delete_function(FunctionName=backend_fn)
+
+
+def test_apigwv1_authorizer_explicit_deny_overrides_allow(apigw_v1, lam):
+    """When the authorizer's policy contains both Allow and Deny statements
+    for the methodArn, the explicit Deny must win — same precedence rules
+    AWS applies to IAM evaluation."""
+    import io as _io
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+    import uuid as _uuid
+    import zipfile as _zf
+
+    suffix = _uuid.uuid4().hex[:8]
+    authz_fn = f"deny-prio-{suffix}"
+    backend_fn = f"backend-{suffix}"
+
+    def _zip(src):
+        buf = _io.BytesIO()
+        with _zf.ZipFile(buf, "w") as z:
+            z.writestr("index.py", src)
+        return buf.getvalue()
+
+    authz_code = (
+        "def handler(event, context):\n"
+        "    return {\n"
+        "        'principalId': 'mixed',\n"
+        "        'policyDocument': {\n"
+        "            'Version': '2012-10-17',\n"
+        "            'Statement': [\n"
+        "                {'Action': 'execute-api:Invoke', 'Effect': 'Allow', 'Resource': '*'},\n"
+        "                {'Action': 'execute-api:Invoke', 'Effect': 'Deny',  'Resource': event.get('methodArn', '')},\n"
+        "            ],\n"
+        "        },\n"
+        "        'context': {},\n"
+        "    }\n"
+    )
+    backend_code = (
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': 'ok'}\n"
+    )
+    role = "arn:aws:iam::000000000000:role/test-role"
+    lam.create_function(FunctionName=authz_fn, Runtime="python3.12", Role=role,
+                        Handler="index.handler", Code={"ZipFile": _zip(authz_code)})
+    lam.create_function(FunctionName=backend_fn, Runtime="python3.12", Role=role,
+                        Handler="index.handler", Code={"ZipFile": _zip(backend_code)})
+
+    api_id = apigw_v1.create_rest_api(name=f"v1-deny-prio-{suffix}")["id"]
+    try:
+        root = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+        res_id = apigw_v1.create_resource(restApiId=api_id, parentId=root["id"], pathPart="probe")["id"]
+        auth = apigw_v1.create_authorizer(
+            restApiId=api_id, name="deny-prio", type="TOKEN",
+            identitySource="method.request.header.Authorization",
+            authorizerUri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{authz_fn}/invocations"
+            ),
+        )
+        apigw_v1.put_method(restApiId=api_id, resourceId=res_id, httpMethod="GET",
+                            authorizationType="CUSTOM", authorizerId=auth["id"])
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=res_id, httpMethod="GET",
+            type="AWS_PROXY", integrationHttpMethod="POST",
+            uri=(
+                f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                f"arn:aws:lambda:us-east-1:000000000000:function:{backend_fn}/invocations"
+            ),
+        )
+        dep = apigw_v1.create_deployment(restApiId=api_id)["id"]
+        apigw_v1.create_stage(restApiId=api_id, stageName="probe", deploymentId=dep)
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/probe/probe"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", "any")
+        try:
+            _urlreq.urlopen(req)
+            raise AssertionError("expected 403 (Deny must win)")
+        except _urlerr.HTTPError as e:
+            assert e.code == 403
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        lam.delete_function(FunctionName=authz_fn)
+        lam.delete_function(FunctionName=backend_fn)
