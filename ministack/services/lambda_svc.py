@@ -48,7 +48,7 @@ from typing import Any
 from urllib.parse import unquote
 
 from ministack.core.lambda_runtime import get_or_create_worker, invalidate_worker
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.persistence import PERSIST_STATE, STATE_DIR, load_state
 from ministack.core.responses import (
     _12_DIGIT_RE,
     AccountScopedDict,
@@ -222,19 +222,113 @@ _poller_lock = threading.Lock()
 
 
 # ── Persistence ────────────────────────────────────────────
+#
+# Background: prior to PoC, get_state() base64-encoded every function's
+# code_zip bytes INTO `lambda.json`. For a workload like GoFreight's
+# svc-automation (26 Lambdas × ~30 MB each), this produced a 1+ GB JSON
+# state file that the restore path then base64-decoded back into heap
+# at every restart — turning a ~30 second OOM-survivable container start
+# into a ~5 minute heap-balloon walk. The on-disk JSON also had to be
+# parsed in one shot (no streaming), pushing peak memory to ~2× the
+# encoded size.
+#
+# PoC fix: write each function's code_zip (and per-version code_zip) to
+# its OWN file under ${STATE_DIR}/lambda-blobs/{sha256}.zip on save,
+# and replace the bytes in the JSON state with a `{"code_blob_ref": sha}`
+# marker. Restore reads the marker, opens the blob, hands bytes back into
+# `_functions._data[name]["code_zip"]` — same in-memory shape as before,
+# so invoke / update / delete / publish-version code paths see no change.
+#
+# Storage characteristics:
+#  - JSON state file: shrinks from O(N × code_size) to O(N) (just refs).
+#  - Disk usage: same total bytes as before (was inside JSON, now on disk
+#    next to it); but content-addressed by sha256 = automatic dedup if
+#    two functions share identical code.
+#  - Memory at restore: still loads each zip into heap (same as before).
+#    Removing that requires a deeper refactor (lazy-load on invoke) —
+#    out of scope for the PoC, see TODO at bottom of this section.
+#
+# Backward compat: restore_state still accepts the legacy `code_zip: str`
+# (base64-encoded inline) shape, so old persistence files keep working
+# without a one-shot migration.
+
+CODE_BLOB_DIR = os.path.join(STATE_DIR, "lambda-blobs")
+
+
+def _write_code_blob(code_zip: bytes) -> str:
+    """Write code_zip bytes to a content-addressed blob file. Returns sha256 hex."""
+    sha = hashlib.sha256(code_zip).hexdigest()
+    os.makedirs(CODE_BLOB_DIR, exist_ok=True)
+    path = os.path.join(CODE_BLOB_DIR, f"{sha}.zip")
+    if not os.path.exists(path):
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(code_zip)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    return sha
+
+
+def _read_code_blob(sha: str) -> bytes | None:
+    """Read a blob by sha256. Returns None if missing — caller decides whether to fail loudly."""
+    path = os.path.join(CODE_BLOB_DIR, f"{sha}.zip")
+    if not os.path.exists(path):
+        logger.error("Lambda persistence: blob %s missing at %s", sha, path)
+        return None
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError as e:
+        logger.error("Lambda persistence: failed to read blob %s: %s", sha, e)
+        return None
+
+
+def _serialize_code_zip(func: dict) -> None:
+    """In-place: replace func['code_zip'] (bytes) with a blob ref. No-op if no code_zip."""
+    code = func.get("code_zip")
+    if not code:
+        return
+    if isinstance(code, bytes):
+        sha = _write_code_blob(code)
+        func["code_zip"] = {"code_blob_ref": sha}
+    # If already a dict (re-serialize) or legacy str (base64 inline), leave as-is.
+
+
+def _deserialize_code_zip(func: dict) -> None:
+    """In-place: replace func['code_zip'] blob ref with bytes. Handles legacy str shape too."""
+    code = func.get("code_zip")
+    if not code:
+        return
+    if isinstance(code, dict) and "code_blob_ref" in code:
+        blob = _read_code_blob(code["code_blob_ref"])
+        if blob is not None:
+            func["code_zip"] = blob
+        else:
+            # Blob file missing — drop the ref so downstream code sees no code,
+            # rather than carrying a dict that breaks bytes-typed consumers.
+            func["code_zip"] = None
+    elif isinstance(code, str):
+        # Legacy persistence format: base64-encoded inline.
+        func["code_zip"] = base64.b64decode(code)
+
 
 def get_state():
-    """Return JSON-serializable state. code_zip bytes are base64-encoded."""
+    """Return JSON-serializable state. code_zip bytes are written to blob files;
+    the returned state holds only a sha256 reference per code_zip."""
     from ministack.core.responses import AccountScopedDict
     funcs = AccountScopedDict()
     # Iterate _data directly to capture ALL accounts, not just current request context
     for scoped_key, func in _functions._data.items():
         f = copy.deepcopy(func)
-        if f.get("code_zip") and isinstance(f["code_zip"], bytes):
-            f["code_zip"] = base64.b64encode(f["code_zip"]).decode()
+        _serialize_code_zip(f)
         for ver in f.get("versions", {}).values():
-            if ver.get("code_zip") and isinstance(ver["code_zip"], bytes):
-                ver["code_zip"] = base64.b64encode(ver["code_zip"]).decode()
+            _serialize_code_zip(ver)
         funcs._data[scoped_key] = f
     return {
         "functions": funcs,
@@ -256,19 +350,15 @@ def restore_state(data):
         funcs = data.get("functions", {})
         if isinstance(funcs, AccountScopedDict):
             for scoped_key, func in funcs._data.items():
-                if func.get("code_zip") and isinstance(func["code_zip"], str):
-                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                _deserialize_code_zip(func)
                 for ver in func.get("versions", {}).values():
-                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
-                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                    _deserialize_code_zip(ver)
                 _functions._data[scoped_key] = func
         else:
             for name, func in funcs.items():
-                if func.get("code_zip") and isinstance(func["code_zip"], str):
-                    func["code_zip"] = base64.b64decode(func["code_zip"])
+                _deserialize_code_zip(func)
                 for ver in func.get("versions", {}).values():
-                    if ver.get("code_zip") and isinstance(ver["code_zip"], str):
-                        ver["code_zip"] = base64.b64decode(ver["code_zip"])
+                    _deserialize_code_zip(ver)
                 _functions[name] = func
         _layers.update(data.get("layers", {}))
         _esms.update(data.get("esms", {}))
@@ -277,6 +367,17 @@ def restore_state(data):
         _dynamodb_stream_positions.update(data.get("dynamodb_stream_positions", {}))
         if _esms:
             _ensure_poller()
+
+
+# TODO(perf): the current PoC still loads every function's code_zip into
+# heap at restore time (same as before). The 1+ GB lambda.json bloat is
+# fixed, but a 1000-function deployment with ~30 MB zips still pulls
+# ~30 GB into heap on warm boot. The next step is on-demand load:
+# replace `code_zip: bytes` in `_functions._data` with a thin wrapper
+# (e.g. namedtuple holding sha256 + path), and have every invoke /
+# update-code site call `_read_code_blob(...)` on demand. That's a much
+# bigger surface change (~50 reference sites across this file) and out
+# of scope for the PoC.
 
 
 # NOTE: the persisted-state load used to run here, but ``restore_state`` calls
